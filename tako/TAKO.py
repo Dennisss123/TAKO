@@ -1,15 +1,11 @@
 from __future__ import annotations
-
 import argparse
 from pathlib import Path
 from typing import Optional
-
 import numpy as np
 import scipy.sparse as sp
-
 from tako.grn import GraphConfig, build_transition_from_expression
 from tako.core import PPRConfig, tako_ko_profile, rank_targets
-
 
 def _load_matrix(path: str) -> np.ndarray:
     p = Path(path)
@@ -19,7 +15,6 @@ def _load_matrix(path: str) -> np.ndarray:
         return sp.load_npz(p).toarray()
     raise ValueError("Unsupported input. Use .npy (dense) or .npz (sparse).")
 
-
 def main():
     ap = argparse.ArgumentParser("TAKO (core logic only)")
     ap.add_argument("--x", type=str, required=True, help="WT expression matrix (cells x genes), .npy or .npz")
@@ -27,12 +22,10 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--tol", type=float, default=1e-8)
     ap.add_argument("--iters", type=int, default=200)
-
     ap.add_argument("--pcr-d", type=int, default=50)
     ap.add_argument("--ridge", type=float, default=0.05)
     ap.add_argument("--top-p", type=float, default=0.15)
     ap.add_argument("--binarize", action="store_true")
-
     ap.add_argument("--rank-metric", type=str, default="raw", choices=["raw", "pos", "abs"])
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--out", type=str, default="tako_out.npz")
@@ -49,10 +42,8 @@ def main():
         random_state=0,
     )
     P, A_masked = build_transition_from_expression(X, gcfg)
-
     pcfg = PPRConfig(alpha=args.alpha, tol=args.tol, max_iter=args.iters)
     s_wt, s_ko, delta_raw, delta_pos, delta_abs = tako_ko_profile(P, args.ko_index, pcfg)
-
     if args.rank_metric == "raw":
         scores = delta_raw
     elif args.rank_metric == "pos":
