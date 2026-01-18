@@ -1,132 +1,113 @@
-# -*- coding: utf-8 -*-
-"""
-tako/core.py — TAKO core algorithms (PPR, restart vectors, KO semantics).
-"""
 from __future__ import annotations
-import re
+
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple, Union
+
 import numpy as np
+import scipy.sparse as sp
 
-def _renorm_rows_inplace(P: np.ndarray):
-    """Normalize rows of P to sum to 1 inplace."""
-    rs = P.sum(axis=1, keepdims=True)
-    rs[rs == 0] = 1.0
-    P /= rs
 
-def ppr_vector(P: np.ndarray, alpha: float, iters: int, tol: float, v: np.ndarray) -> np.ndarray:
+MatrixLike = Union[np.ndarray, sp.spmatrix]
+
+
+@dataclass(frozen=True)
+class PPRConfig:
+    alpha: float = 0.5
+    tol: float = 1e-8
+    max_iter: int = 200
+
+
+def uniform_restart_non_g(G: int, g: int) -> np.ndarray:
+    v = np.full(G, 1.0 / (G - 1), dtype=np.float64)
+    v[g] = 0.0
+    return v
+
+
+def ppr_fixed_point(P: MatrixLike, v: np.ndarray, alpha: float, tol: float, max_iter: int) -> np.ndarray:
     """
-    Compute PageRank vector by power iteration.
-    s = (1-alpha)*v + alpha*s*P
+    Row-vector convention:
+      s = (1-alpha) v + alpha s P
     """
-    v = np.asarray(v, dtype=np.float64)
-    v = v / (v.sum() if v.sum() > 0 else 1.0)
-    s = v.copy()
-    for _ in range(int(iters)):
-        s_new = (1 - alpha) * v + alpha * (s @ P)
-        if tol is not None and tol > 0:
-            if np.linalg.norm(s_new - s, ord=1) < tol:
-                s = s_new
-                break
-        s = s_new
-    
-    s = np.maximum(s, 0.0)
-    if s.sum() > 0:
-        s /= s.sum()
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0,1)")
+    Pm = P.tocsr().astype(np.float64) if sp.issparse(P) else np.asarray(P, dtype=np.float64)
+
+    s = v.astype(np.float64, copy=True)
+    for _ in range(max_iter):
+        sp_term = (s @ Pm) if not sp.issparse(Pm) else (s @ Pm)
+        s_next = (1.0 - alpha) * v + alpha * sp_term
+        if np.sum(np.abs(s_next - s)) <= tol:
+            s = s_next
+            break
+        s = s_next
+
+    z = s.sum()
+    if z > 0:
+        s = s / z
     return s
 
-def make_restart_vector(mode: str, P: np.ndarray, gi: int) -> np.ndarray:
+
+def apply_no_in_out(P: MatrixLike, g: int) -> sp.csr_matrix:
     """
-    Construct the personalization vector 'v'.
+    Strict cut-in-and-out (no-in--out):
+      - zero column g (cut-in)
+      - zero row g, set self-loop at g (cut-out + self-loop)
+      - re-normalize rows; all-zero row -> self-loop
     """
-    n = P.shape[0]
-    if mode == "neighbor":
-        # Restart proportional to direct neighbors of gi
-        v = P[gi, :].astype(np.float64).copy()
-        v[gi] = 0.0
-        if v.sum() <= 0:
-            # Fallback if no neighbors
-            v = np.ones(n, dtype=np.float64); v[gi] = 0.0
-        v = v / v.sum()
-        return v
-    elif mode == "uniform":
-        v = np.ones(n, dtype=np.float64); v[gi] = 0.0
-        v = v / v.sum()
-        return v
-    elif mode == "onehot":
-        v = np.zeros(n, dtype=np.float64); v[gi] = 1.0
-        return v
-    else:
-        raise ValueError(f"Unknown restart mode: {mode}")
+    P_csr = P.tocsr().astype(np.float64) if sp.issparse(P) else sp.csr_matrix(P, dtype=np.float64)
+    G = P_csr.shape[0]
+    if not (0 <= g < G):
+        raise IndexError("g out of range")
 
-def ko_matrix_true(P: np.ndarray, gi: int, mode: str) -> np.ndarray:
+    P_ko = P_csr.tolil(copy=True)
+    P_ko[:, g] = 0.0
+    P_ko[g, :] = 0.0
+    P_ko[g, g] = 1.0
+    P_ko = P_ko.tocsr()
+
+    rs = np.asarray(P_ko.sum(axis=1)).ravel()
+    inv = np.zeros_like(rs, dtype=np.float64)
+    nz = rs > 0
+    inv[nz] = 1.0 / rs[nz]
+    P_ko = sp.diags(inv) @ P_ko
+
+    zero_rows = ~nz
+    if np.any(zero_rows):
+        P_ko = P_ko.tolil()
+        for i in np.where(zero_rows)[0]:
+            P_ko.rows[i] = [i]
+            P_ko.data[i] = [1.0]
+        P_ko = P_ko.tocsr()
+
+    return P_ko
+
+
+def tako_ko_profile(
+    P: MatrixLike,
+    g: int,
+    cfg: PPRConfig = PPRConfig(),
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Apply 'True Knockout' structural changes to the graph P.
+    Returns:
+      s_wt, s_ko, delta_raw, delta_pos, delta_abs
+    where delta_raw = s_wt - s_ko
     """
-    Pk = np.array(P, copy=True, dtype=np.float64)
-    n = Pk.shape[0]
+    G = P.shape[0]
+    v = uniform_restart_non_g(G, g)
 
-    if mode == "no-in-out":
-        # Remove all edges entering or leaving gi
-        Pk[:, gi] = 0.0
-        Pk[gi, :] = 0.0
-        Pk[gi, gi] = 1.0 # Absorb at self to avoid dead end
-        _renorm_rows_inplace(Pk)
-        return Pk
+    s_wt = ppr_fixed_point(P, v, cfg.alpha, cfg.tol, cfg.max_iter)
+    P_ko = apply_no_in_out(P, g)
+    s_ko = ppr_fixed_point(P_ko, v, cfg.alpha, cfg.tol, cfg.max_iter)
 
-    elif mode == "silence-out":
-        # Only remove edges leaving gi (stop regulation downstream)
-        Pk[gi, :] = 0.0
-        Pk[gi, gi] = 1.0
-        _renorm_rows_inplace(Pk)
-        return Pk
+    delta_raw = s_wt - s_ko
+    delta_pos = np.maximum(delta_raw, 0.0)
+    delta_abs = np.abs(delta_raw)
+    return s_wt, s_ko, delta_raw, delta_pos, delta_abs
 
-    elif mode == "restart-row":
-        # Redistribute gi's outgoing weight uniformly
-        Pk[:, gi] = 0.0
-        row = np.ones(n, dtype=np.float64)
-        row[gi] = 0.0
-        row /= row.sum()
-        Pk[gi, :] = row
-        _renorm_rows_inplace(Pk)
-        return Pk
 
-    else:
-        raise ValueError(f"Unknown ko-mode: {mode}")
-
-def parse_topk(s: str) -> list[int]:
-    """Parse comma-separated top-k string e.g. '10,20'."""
-    if s is None:
-        return []
-    out = []
-    for x in re.split(r"[,\s]+", str(s).strip()):
-        if not x:
-            continue
-        try:
-            out.append(int(x))
-        except Exception:
-            pass
-    out = [k for k in out if k > 0]
-    return sorted(list(dict.fromkeys(out)))
-
-def precision_recall_at_k(y: np.ndarray, score: np.ndarray, ks: list[int]) -> tuple[dict[int,float], dict[int,float]]:
-    """Compute Precision and Recall at K."""
-    y = np.asarray(y).astype(int)
-    score = np.asarray(score).astype(float)
-    
-    # Sort by score descending
-    order = np.argsort(-score, kind="mergesort")
-    y_sorted = y[order]
-    
-    pos = int(y.sum())
-    P_at, R_at = {}, {}
-    
-    for k in ks:
-        k = int(k)
-        if k <= 0:
-            continue
-        kk = min(k, len(y_sorted))
-        tp = int(y_sorted[:kk].sum())
-        
-        P_at[k] = tp / float(kk) if kk > 0 else float("nan")
-        R_at[k] = tp / float(pos) if pos > 0 else float("nan")
-        
-    return P_at, R_at
+def rank_targets(scores: np.ndarray, exclude_index: Optional[int] = None, descending: bool = True) -> np.ndarray:
+    x = scores.copy()
+    if exclude_index is not None and 0 <= exclude_index < x.size:
+        x[exclude_index] = -np.inf if descending else np.inf
+    order = np.argsort(x)
+    return order[::-1] if descending else order
