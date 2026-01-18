@@ -1,203 +1,119 @@
-# -*- coding: utf-8 -*-
-"""
-tako/grn.py — Graph construction (PCR/SVD-Regression) and normalization utils.
-"""
 from __future__ import annotations
-import re
-import random
-import warnings
-from pathlib import Path
+
+from dataclasses import dataclass
+from typing import Tuple
+
 import numpy as np
-import pandas as pd
+import scipy.sparse as sp
+from sklearn.utils.extmath import randomized_svd
 
-# ---------- Name & String Utils ----------
-_G_PAT = re.compile(r"^(?:G|GENE)?\s*(\d+)$", re.IGNORECASE)
 
-def norm_gene_label(x) -> str:
-    s = str(x).strip().upper()
-    m = _G_PAT.match(s)
-    if m: return f"G{int(m.group(1))}"
-    return s
+@dataclass(frozen=True)
+class GraphConfig:
+    # PCR/SVD
+    n_components: int = 50          # D
+    ridge_lambda: float = 0.05      # lambda
+    # sparsify
+    top_p: float = 0.15             # keep global top p% by |A| (off-diagonal)
+    binarize: bool = False
+    random_state: int = 0
 
-def norm_list(xs) -> list[str]:
-    return [norm_gene_label(x) for x in xs]
 
-def _looks_like_gene_names(names, sample: int = 200) -> float:
-    if not names:
-        return 0.0
-    n = min(sample, len(names))
-    idx = random.sample(range(len(names)), n)
-    geneish = 0
-    pat_gene = re.compile(r"^[A-Za-z0-9\-\.]{2,15}$")
-    for i in idx:
-        s = str(names[i])
-        if ":" in s: continue
-        parts = s.split("_")
-        if len(parts) > 1 and any(ch.isdigit() for ch in parts[0]):
-            continue
-        if pat_gene.match(s):
-            geneish += 1
-    return geneish / float(n)
+def _row_normalize_nonneg(W: sp.csr_matrix) -> sp.csr_matrix:
+    rs = np.asarray(W.sum(axis=1)).ravel()
+    inv = np.zeros_like(rs, dtype=np.float64)
+    nz = rs > 0
+    inv[nz] = 1.0 / rs[nz]
+    P = sp.diags(inv) @ W
 
-def row_normalize(W: np.ndarray) -> np.ndarray:
-    W = np.asarray(W, dtype=np.float64)
-    W = np.where(np.isfinite(W), W, 0.0)
-    W = np.maximum(W, 0.0)
-    rs = W.sum(axis=1, keepdims=True)
-    rs[rs == 0] = 1.0
-    P = W / rs
+    # any all-zero row -> self-loop
+    zero_rows = ~nz
+    if np.any(zero_rows):
+        P = P.tolil()
+        for i in np.where(zero_rows)[0]:
+            P.rows[i] = [i]
+            P.data[i] = [1.0]
+        P = P.tocsr()
     return P
 
-# ---------- Normalization / HVG ----------
 
-def _cp10k_log1p(X: np.ndarray, axis_cells: int) -> np.ndarray:
-    X = np.asarray(X, dtype=np.float64, order="F")
-    if axis_cells == 1:
-        lib = X.sum(axis=0, keepdims=True)
-        lib[lib == 0] = 1.0
-        Xn = X / lib * 1e4
-    else:
-        lib = X.sum(axis=1, keepdims=True)
-        lib[lib == 0] = 1.0
-        Xn = X / lib * 1e4
-    return np.log1p(Xn)
-
-def _select_hvg_by_var_after_log(X_log: np.ndarray, gene_names_full: list[str], hvg: int,
-                                whitelist: list[str], axis_genes: int) -> tuple[np.ndarray, list[str]]:
-    Xg = X_log if axis_genes == 0 else X_log.T
-    var = Xg.var(axis=1)
-    order = np.argsort(-var)
-
-    keep = set(order[: min(hvg, len(order))].tolist())
-    for g in whitelist:
-        if g in gene_names_full:
-            keep.add(gene_names_full.index(g))
-
-    keep = sorted(list(keep))
-    gene_names = [gene_names_full[i] for i in keep]
-    X_keep = Xg[keep, :]
-    return X_keep, gene_names
-
-# ---------- Main Graph Builders ----------
-
-def build_W_corr_from_counts_with_names(counts_csv: str, cutoff: float = 60.0,
-                                        hvg: int = 3000, corr_dtype: str = "float32",
-                                        whitelist: list[str] | None = None) -> tuple[np.ndarray, list[str]]:
-    df = pd.read_csv(counts_csv, header=0, index_col=0)
-    r, c = df.shape
-    
-    row_score = _looks_like_gene_names(list(df.index))
-    col_score = _looks_like_gene_names(list(df.columns))
-    rows_as_genes = (row_score > col_score) or (row_score == col_score and r <= c)
-
-    if rows_as_genes:
-        gene_names_full = norm_list(df.index.tolist())
-        X_full = df.to_numpy(dtype=np.float64)
-        axis_genes, axis_cells = 0, 1
-    else:
-        gene_names_full = norm_list(df.columns.tolist())
-        X_full = df.to_numpy(dtype=np.float64)
-        axis_genes, axis_cells = 1, 0
-
-    whitelist = [norm_gene_label(s) for s in (whitelist or []) if str(s).strip()]
-
-    X_log = _cp10k_log1p(X_full, axis_cells=axis_cells)
-    Xg, gene_names = _select_hvg_by_var_after_log(X_log, gene_names_full, hvg, whitelist, axis_genes=axis_genes)
-    
-    X = Xg - Xg.mean(axis=1, keepdims=True)
-    denom = np.sqrt((X * X).sum(axis=1, keepdims=True))
-    denom[denom == 0] = 1.0
-    Xn = X / denom
-
-    C = (Xn @ Xn.T) / max(1, Xn.shape[1] - 1)
-    np.fill_diagonal(C, 0.0)
-
-    thr = np.percentile(np.abs(C).ravel(), cutoff)
-    W = np.where(np.abs(C) >= thr, np.abs(C), 0.0).astype(corr_dtype, copy=False)
-    W = row_normalize(W)
-    return W, gene_names
-
-def build_W_pcr_struct(counts_csv: str,
-                       hvg: int = 3000,
-                       whitelist: list[str] | None = None,
-                       pc_d: int = 10,
-                       top_pct: float = 8.0,
-                       ridge: float = 0.05,
-                       binarize: int = 0) -> tuple[np.ndarray, list[str]]:
+def pcr_directed_interaction(
+    X_cells_genes: np.ndarray,
+    n_components: int,
+    ridge_lambda: float,
+    random_state: int = 0,
+) -> np.ndarray:
     """
-    Build Directed Graph using Principal Component Regression (SVD-based).
-    Technique: Beta = (Z'Z + lambda*I)^-1 Z' X, where Z are PCs of expression.
+    GENKI-PCR style:
+      - X: cells x genes (log-normalized)
+      - build Xg: genes x cells, mean-center per gene
+      - thin SVD keep D
+      - ridge in cell-score space, back-project => A (genes x genes)
     """
-    df = pd.read_csv(counts_csv, header=0, index_col=0)
-    r, c = df.shape
-    
-    row_score = _looks_like_gene_names(list(df.index))
-    col_score = _looks_like_gene_names(list(df.columns))
-    rows_as_genes = (row_score > col_score) or (row_score == col_score and r <= c)
+    Xg = X_cells_genes.T.astype(np.float64)  # genes x cells
+    Xg = Xg - Xg.mean(axis=1, keepdims=True)
 
-    if rows_as_genes:
-        gene_names_full = norm_list(df.index.tolist())
-        X_full = df.to_numpy(dtype=np.float64)   # genes x cells
-        axis_genes, axis_cells = 0, 1
-    else:
-        gene_names_full = norm_list(df.columns.tolist())
-        X_full = df.to_numpy(dtype=np.float64)   # cells x genes
-        axis_genes, axis_cells = 1, 0
+    D = min(n_components, min(Xg.shape[0], Xg.shape[1]))
+    U, S, Vt = randomized_svd(Xg, n_components=D, random_state=random_state)
 
-    whitelist = [norm_gene_label(s) for s in (whitelist or []) if str(s).strip()]
+    # cell scores (cells x D)
+    Z = (Vt.T * S.reshape(1, -1))
 
-    X_log = _cp10k_log1p(X_full, axis_cells=axis_cells)
-    Xg, gene_names = _select_hvg_by_var_after_log(X_log, gene_names_full, hvg, whitelist, axis_genes=axis_genes)
-    
-    p = Xg.shape[0]
-    if p < 10:
-        warnings.warn(f"[PCR] Too few genes after HVG: p={p}", RuntimeWarning)
+    Y = Xg.T  # cells x genes
+    M = Z.T @ Z + ridge_lambda * np.eye(D, dtype=np.float64)
+    RHS = Z.T @ Y
+    B = np.linalg.solve(M, RHS)  # D x genes
+    A = U @ B                    # genes x genes
 
-    # PCA/SVD on cells x genes
-    X_cg = Xg.T  # cells x genes
-    X_cg = X_cg - X_cg.mean(axis=0, keepdims=True)
-    
-    U, S, Vt = np.linalg.svd(X_cg, full_matrices=False)
-    rnk = int(np.sum(S > 1e-12))
-    if pc_d > rnk:
-        warnings.warn(f"[PCR] pc_d={pc_d} > rank={rnk}; use {rnk}.", RuntimeWarning)
-    d = min(int(pc_d), Vt.shape[0])
-    
-    Z = U[:, :d] * S[:d]
-
-    # Ridge Regression
-    ZTZ = Z.T @ Z
-    ZTZ.flat[::ZTZ.shape[0] + 1] += ridge
-    ZTZ_inv = np.linalg.inv(ZTZ)
-    B = ZTZ_inv @ Z.T @ X_cg
-
-    # Reconstruct Adjacency A = V' * B
-    A = (Vt[:d, :].T @ B)
     np.fill_diagonal(A, 0.0)
+    return A
 
-    # Keep top-% edges
-    absA = np.abs(A)
-    thr = np.percentile(absA.ravel(), 100.0 - top_pct)
+
+def sparsify_top_p(A: np.ndarray, top_p: float) -> np.ndarray:
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError("top_p must be in (0, 1].")
+
+    G = A.shape[0]
+    absA = np.abs(A).astype(np.float64)
+    absA[np.eye(G, dtype=bool)] = 0.0
+
+    vals = absA.ravel()
+    vals = vals[vals > 0]
+    if vals.size == 0:
+        return np.zeros_like(A)
+
+    thr = np.quantile(vals, 1.0 - top_p)
     mask = absA >= thr
-    A_masked = A * mask
+    mask[np.eye(G, dtype=bool)] = False
 
-    W = np.abs(A_masked)
-    if int(binarize) == 1:
-        W = (W > 0).astype(np.float64)
+    A_masked = np.zeros_like(A, dtype=np.float64)
+    A_masked[mask] = A[mask]
+    return A_masked
 
-    W = row_normalize(W).astype("float32", copy=False)
-    return W, gene_names
 
-def load_W(path: str) -> np.ndarray:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(path)
-    if p.suffix.lower() == ".npy":
-        W = np.load(str(p))
-    else:
-        W = pd.read_csv(str(p), header=None).to_numpy(dtype=float)
-    W = np.asarray(W, dtype=float)
+def interaction_to_transition(A: np.ndarray, binarize: bool = False) -> sp.csr_matrix:
+    W = np.abs(A).astype(np.float64)
     np.fill_diagonal(W, 0.0)
-    W[W < 0] = 0.0
-    W = row_normalize(W)
-    return W
+    if binarize:
+        W = (W > 0).astype(np.float64)
+    return _row_normalize_nonneg(sp.csr_matrix(W))
+
+
+def build_transition_from_expression(
+    X_cells_genes: np.ndarray,
+    cfg: GraphConfig,
+) -> Tuple[sp.csr_matrix, np.ndarray]:
+    """
+    Returns:
+      P: row-stochastic transition (genes x genes, csr)
+      A_masked: masked directed interaction (genes x genes, dense)
+    """
+    A = pcr_directed_interaction(
+        X_cells_genes,
+        n_components=cfg.n_components,
+        ridge_lambda=cfg.ridge_lambda,
+        random_state=cfg.random_state,
+    )
+    A_masked = sparsify_top_p(A, cfg.top_p)
+    P = interaction_to_transition(A_masked, binarize=cfg.binarize)
+    return P, A_masked
