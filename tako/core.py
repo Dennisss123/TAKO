@@ -24,14 +24,9 @@ def uniform_restart_non_g(G: int, g: int) -> np.ndarray:
 
 
 def ppr_fixed_point(P: MatrixLike, v: np.ndarray, alpha: float, tol: float, max_iter: int) -> np.ndarray:
-    """
-    Row-vector convention:
-      s = (1-alpha) v + alpha s P
-    """
     if not (0.0 < alpha < 1.0):
         raise ValueError("alpha must be in (0,1)")
     Pm = P.tocsr().astype(np.float64) if sp.issparse(P) else np.asarray(P, dtype=np.float64)
-
     s = v.astype(np.float64, copy=True)
     for _ in range(max_iter):
         sp_term = (s @ Pm) if not sp.issparse(Pm) else (s @ Pm)
@@ -40,7 +35,6 @@ def ppr_fixed_point(P: MatrixLike, v: np.ndarray, alpha: float, tol: float, max_
             s = s_next
             break
         s = s_next
-
     z = s.sum()
     if z > 0:
         s = s / z
@@ -48,12 +42,6 @@ def ppr_fixed_point(P: MatrixLike, v: np.ndarray, alpha: float, tol: float, max_
 
 
 def apply_no_in_out(P: MatrixLike, g: int) -> sp.csr_matrix:
-    """
-    Strict cut-in-and-out (no-in--out):
-      - zero column g (cut-in)
-      - zero row g, set self-loop at g (cut-out + self-loop)
-      - re-normalize rows; all-zero row -> self-loop
-    """
     P_csr = P.tocsr().astype(np.float64) if sp.issparse(P) else sp.csr_matrix(P, dtype=np.float64)
     G = P_csr.shape[0]
     if not (0 <= g < G):
@@ -87,11 +75,6 @@ def tako_ko_profile(
     g: int,
     cfg: PPRConfig = PPRConfig(),
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns:
-      s_wt, s_ko, delta_raw, delta_pos, delta_abs
-    where delta_raw = s_wt - s_ko
-    """
     G = P.shape[0]
     v = uniform_restart_non_g(G, g)
 
