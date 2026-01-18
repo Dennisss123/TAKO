@@ -10,11 +10,7 @@ from sklearn.utils.extmath import randomized_svd
 
 @dataclass(frozen=True)
 class GraphConfig:
-    # PCR/SVD
-    n_components: int = 50          # D
-    ridge_lambda: float = 0.05      # lambda
-    # sparsify
-    top_p: float = 0.15             # keep global top p% by |A| (off-diagonal)
+    top_p: float = 0.15            
     binarize: bool = False
     random_state: int = 0
 
@@ -43,13 +39,6 @@ def pcr_directed_interaction(
     ridge_lambda: float,
     random_state: int = 0,
 ) -> np.ndarray:
-    """
-    GENKI-PCR style:
-      - X: cells x genes (log-normalized)
-      - build Xg: genes x cells, mean-center per gene
-      - thin SVD keep D
-      - ridge in cell-score space, back-project => A (genes x genes)
-    """
     Xg = X_cells_genes.T.astype(np.float64)  # genes x cells
     Xg = Xg - Xg.mean(axis=1, keepdims=True)
 
@@ -103,11 +92,6 @@ def build_transition_from_expression(
     X_cells_genes: np.ndarray,
     cfg: GraphConfig,
 ) -> Tuple[sp.csr_matrix, np.ndarray]:
-    """
-    Returns:
-      P: row-stochastic transition (genes x genes, csr)
-      A_masked: masked directed interaction (genes x genes, dense)
-    """
     A = pcr_directed_interaction(
         X_cells_genes,
         n_components=cfg.n_components,
