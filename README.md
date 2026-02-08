@@ -8,7 +8,7 @@ Pipeline:
 ## Environment
 
 - Python >= 3.10
-- See `requirements.txt` for pinned dependencies.
+- See `requirements.txt` for pinned dependencies
 
 ## Installation
 
