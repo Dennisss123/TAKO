@@ -44,14 +44,3 @@ The code in this repository corresponds to the version used in the manuscript:
 ```text
 Release: v1.0.0
 Commit: 277d1cf
-
-```text
-TAKO/
-├── tako/
-│   ├── __init__.py
-│   ├── TAKO.py
-│   ├── core.py
-│   └── grn.py
-├── requirements.txt
-├── License
-└── README.md
