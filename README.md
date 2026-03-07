@@ -45,8 +45,6 @@ The code in this repository corresponds to the version used in the manuscript:
 Release: v1.0.0
 Commit: 277d1cf
 
-## Repository structure
-
 ```text
 TAKO/
 ├── tako/
