@@ -37,6 +37,14 @@ Genes ranked by these scores represent predicted **KO-responsive targets**.
 
 ---
 
+## Reproducibility
+
+The code in this repository corresponds to the version used in the manuscript:
+
+```text
+Release: v1.0.0
+Commit: 277d1cf
+
 ## Repository structure
 
 ```text
